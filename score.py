@@ -1,21 +1,17 @@
-# score.py (Azure ML Batch Endpoint) — end-to-end
-# Założenia zgodne z Twoimi ustaleniami:
-# 1) INPUT: każdy plik wejściowy .json ma ROOT = dokument (bez wrappera {"document":..., "num_preds":...})
-# 2) num_preds pochodzi z env var: NUM_PREDS (default: 3)
-# 3) OUTPUT: zawsze poprawny JSON; zawsze zwracamy dokument (wynik inference lub wejściowy fallback)
-#    + metadata (status/error) — nigdy nie zwracamy "gołego" {"error":...} zamiast dokumentu
-# 4) Nie zmieniamy logiki init()/inference()/is_relevant_customer_demand() poza niezbędnymi importami;
-#    jedyne zmiany logiczne są w run() (batch contract + error handling + stały output)
+# score.py (Batch Endpoint) — możliwie 1:1 jak oryginał
+# Zmiany ograniczone do minimum:
+# - run(): batch contract (mini_batch = lista ścieżek do plików), root=document, NUM_PREDS z env
+# - obsługa błędów per plik + stały output (zawsze JSON + metadata)
+# - wymuszenie JSON-serializable (żeby w output nie było pythonowego repr z apostrofami)
 
 import os
 import time
 import json
-import logging
 import pandas as pd
-
 from models.logistic_regression import LogisticRegression  # noqa
 from models.transformer import Transformer  # noqa
 import pre_processing  # noqa
+import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,14 +28,9 @@ def init():
 
     logger.info("Initializing model...")
     model = os.getenv("AZUREML_MODEL_DIR")
-    if not model:
-        raise RuntimeError("AZUREML_MODEL_DIR is not set")
-
-    # debug jak w Twoim oryginale (zostawiam)
     print(f"line 23: {os.listdir(model)}")
     print(f"line 24: {model}")
 
-    # struktura modelu jak w Twoim kodzie
     model = os.path.join(model, "albot")
     print(f"line 27: {os.listdir(model)}")
 
@@ -53,8 +44,13 @@ def init():
 
     transformer = os.path.join(model, "transformer_model")
 
-    model_cd_transformer_path = os.path.join(transformer, "transformer")
-    model_cd_transformer_le_path = os.path.join(transformer, "transformer_le.joblib")
+    model_cd_transformer_path = os.path.join(
+        transformer, "transformer"
+    )
+
+    model_cd_transformer_le_path = os.path.join(
+        transformer, "transformer_le.joblib"
+    )
 
     cd_transformer_model = Transformer.load(
         model_cd_transformer_path,
@@ -85,20 +81,23 @@ def is_relevant_customer_demand(
     )
 
 
-def inference(document: json, num_cd_predictions: int):
+def inference(
+    document: json,
+    num_cd_predictions: int
+):
     # load and process document
     start_time = time.time()
-
+    # document = json.loads(document)[0]
     text = pd.Series(
-        content["text"]
-        for content in document["contentDomain"]["byId"].values()
+        content["text"] for content in
+        document["contentDomain"]["byId"].values()
     )
 
     text = pre_processing.clean_text(text)
     latency = time.time() - start_time
     print("Time to load and clean document: {}".format(latency))
 
-    # score relevance model
+    # score relevence model
     start_time = time.time()
     all_relevance_predictions = relevance_model.predict_proba(text)[:, 1]
     latency = time.time() - start_time
@@ -106,16 +105,20 @@ def inference(document: json, num_cd_predictions: int):
 
     # score cd logreg model
     start_time = time.time()
-    all_cd_logreg_predictions = cd_logreg_model.predict_top_n_labels_with_proba(
-        text, num_cd_predictions
+    all_cd_logreg_predictions = (
+        cd_logreg_model.predict_top_n_labels_with_proba(
+            text, num_cd_predictions
+        )
     )
     latency = time.time() - start_time
     print("Time to score cd logreg model: {}".format(latency))
 
     # score cd transformer
     start_time = time.time()
-    all_cd_transformer_predictions = cd_transformer_model.predict_top_n_labels_with_proba(
-        text, num_cd_predictions
+    all_cd_transformer_predictions = (
+        cd_transformer_model.predict_top_n_labels_with_proba(
+            text, num_cd_predictions
+        )
     )
     latency = time.time() - start_time
     print("Time to score cd transformer model: {}".format(latency))
@@ -141,7 +144,9 @@ def inference(document: json, num_cd_predictions: int):
             cd_logreg_predictions[0]["proba"],
             cd_transformer_predictions[0]["proba"],
         ):
-            document_demand_predictions.add(cd_transformer_predictions[0]["label"])
+            document_demand_predictions.add(
+                cd_transformer_predictions[0]["label"]
+            )
 
         content.update(
             {
@@ -151,49 +156,50 @@ def inference(document: json, num_cd_predictions: int):
             }
         )
 
-    document["documentDemandPredictions"] = list(document_demand_predictions)
+    # update document to include document_demand_predictions
+    document['documentDemandPredictions'] = list(document_demand_predictions)
+
+    result = document
 
     latency = time.time() - start_time
     print("Time to format results: {}".format(latency))
 
-    return document
+    return result
 
 
+# ===========
+# BATCH CHANGE
+# ===========
 def run(mini_batch):
     """
-    Azure ML Batch Endpoint contract:
-      - mini_batch: list of file paths
-      - each file content is JSON where ROOT is the document
-
-    num_preds:
-      - taken from env var NUM_PREDS (default 3)
+    Batch Endpoint:
+      - mini_batch = list of file paths
+      - each file JSON ROOT = document
+      - num_preds from env var NUM_PREDS (default 3)
 
     Output:
-      - always returns a JSON-serializable object
-      - always includes the document (in predictions)
-      - always includes metadata with status and error info
+      - always returns a valid JSON object with:
+          {"predictions": <document>, "metadata": {...}}
+      - on error: predictions = input document if parsed, else {}
     """
     results = []
 
-    # num_preds from env
-    num_preds_env = os.getenv("NUM_PREDS", "3")
+    # NUM_PREDS from env (default 3)
     try:
-        num_pred = int(num_preds_env)
+        num_pred = int(os.getenv("NUM_PREDS", "3"))
     except ValueError:
         num_pred = 3
-        logger.warning(f"NUM_PREDS is not an int: {num_preds_env}. Using {num_pred}.")
+        logger.warning("NUM_PREDS is not an int. Using %s.", num_pred)
 
     for item in mini_batch:
-        start = time.time()
         input_document = None
 
         metadata = {
-            "status": "ok",          # ok | error
+            "status": "ok",
             "error_type": None,
             "error_message": None,
             "input_file": item,
             "num_preds": num_pred,
-            "processing_ms": None,
         }
 
         try:
@@ -203,56 +209,40 @@ def run(mini_batch):
             with open(item, "r", encoding="utf-8") as f:
                 raw_data = f.read()
 
+            logger.info(f"Received request with data from file: {item}")
+
             if not raw_data or raw_data.strip() == "":
                 raise ValueError("Request body cannot be empty!")
 
-            # Parse JSON document (root)
+            # ROOT=document
             try:
                 input_document = json.loads(raw_data)
-            except json.JSONDecodeError as je:
-                raise ValueError(f"Invalid JSON format: {str(je)}")
+            except json.JSONDecodeError:
+                raise ValueError("Invalid JSON format!")
 
-            # Minimal structure check (optional but helps catch bad inputs early)
-            if (
-                "contentDomain" not in input_document
-                or "byId" not in input_document.get("contentDomain", {})
-            ):
+            # minimal sanity check (keeps failures predictable)
+            if "contentDomain" not in input_document or "byId" not in input_document.get("contentDomain", {}):
                 raise ValueError("Invalid document format (missing contentDomain.byId).")
 
-            # Inference
-            output_document = inference(input_document, num_pred)
+            response = inference(input_document, num_pred)
 
-            # Ensure JSON output (prevents accidental Python repr with single quotes)
-            output_document = json.loads(json.dumps(output_document, default=str))
+            # force JSON-serializable (prevents output with python repr / single quotes)
+            response = json.loads(json.dumps(response, default=str))
 
-            metadata["processing_ms"] = int((time.time() - start) * 1000)
-
-            results.append(
-                {
-                    "predictions": output_document,
-                    "metadata": metadata,
-                }
-            )
+            results.append({"predictions": response, "metadata": metadata})
 
         except Exception as e:
-            logger.error(f"Error processing item {item}: {str(e)}", exc_info=True)
+            logger.error(f"Error processing file {item}: {str(e)}", exc_info=True)
 
             metadata["status"] = "error"
             metadata["error_type"] = type(e).__name__
             metadata["error_message"] = str(e)
-            metadata["processing_ms"] = int((time.time() - start) * 1000)
 
-            # Fallback: always return a document-like JSON.
-            # If parsing succeeded, return the original input doc (no data loss).
-            # If parsing failed, return {}.
-            fallback_document = input_document if isinstance(input_document, dict) else {}
-            fallback_document = json.loads(json.dumps(fallback_document, default=str))
+            # fallback: never lose input if we managed to parse it
+            fallback = input_document if isinstance(input_document, dict) else {}
+            fallback = json.loads(json.dumps(fallback, default=str))
 
-            results.append(
-                {
-                    "predictions": fallback_document,
-                    "metadata": metadata,
-                }
-            )
+            results.append({"predictions": fallback, "metadata": metadata})
 
     return results
+
